@@ -1,0 +1,122 @@
+name: WorkBuddy AI 国际版每日活跃
+
+# ─────────────────────────────────────────────────────────────
+#  WorkBuddy AI（workbuddy.ai）每日活跃 → 积分
+#  国际版没有签到按钮：当天发起一次客户端对话，服务端才记活跃，
+#  免费用户 30 积分/天、Pro 用户 50 积分/天（服务端延迟发放）。
+#  本工作流复刻桌面端链路：刷新令牌 → 会话登记 → 对话 → 遥测 → 查积分。
+#
+#  Secrets：
+#    WB_INTL_REFRESH_TOKEN  必填，国际版长效令牌
+#    WB_INTL_UID            必填，账号 UID（可由令牌解析时可不填）
+#    WB_INTL_DOMAIN         可选，默认 www.workbuddy.ai
+#    WB_INTL_ENTERPRISE_ID  可选，企业账号
+#    WB_INTL_NICKNAME       可选，遥测昵称
+#    PUSHPLUS_TOKEN         可选，复用微信推送
+#    SUCCESS_NOTIFY         可选，true 时成功也推送；失败始终推送
+# ─────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 北京时间 09:07 = UTC 01:07（避开整点拥堵）
+    - cron: '7 1 * * *'
+  workflow_dispatch:
+    inputs:
+      model:
+        description: '模型（默认 hy3）'
+        required: false
+        default: 'hy3'
+        type: string
+      prompt:
+        description: '自定义提问（留空用默认多句问题）'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: workbuddy-intl-active
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  active:
+    name: 国际版活跃
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      WB_INTL_REFRESH_TOKEN: ${{ secrets.WB_INTL_REFRESH_TOKEN }}
+      WB_INTL_UID: ${{ secrets.WB_INTL_UID }}
+      WB_INTL_DOMAIN: ${{ secrets.WB_INTL_DOMAIN }}
+      WB_INTL_ENTERPRISE_ID: ${{ secrets.WB_INTL_ENTERPRISE_ID }}
+      WB_INTL_NICKNAME: ${{ secrets.WB_INTL_NICKNAME }}
+      WB_INTL_MODEL: ${{ inputs.model || 'hy3' }}
+      WB_INTL_PROMPT: ${{ inputs.prompt || '' }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检查凭据
+        run: |
+          if [ -z "$WB_INTL_REFRESH_TOKEN" ]; then
+            echo "::error::未配置 WB_INTL_REFRESH_TOKEN（国际版长效令牌）。"
+            exit 1
+          fi
+          if [ -z "$WB_INTL_UID" ]; then
+            echo "::warning::未配置 WB_INTL_UID，脚本将尝试从令牌解析。"
+          fi
+          echo "✓ 凭据已配置（内容不外显）；域名：${WB_INTL_DOMAIN:-www.workbuddy.ai}"
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 发送活跃对话
+        id: active
+        run: |
+          set +e
+          python scripts/intl_workbuddy_checkin.py | tee result.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "active_exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: 输出运行摘要
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          try:
+              r = json.load(open("result.json", encoding="utf-8"))
+          except Exception as e:
+              print("无法读取 result.json: %s" % e); raise SystemExit(0)
+          d = r.get("detail") or {}
+          print("### WorkBuddy AI 国际版活跃")
+          print("")
+          print("| 字段 | 值 |")
+          print("|---|---|")
+          for k, label in (("status", "状态"), ("action", "动作"), ("model", "模型"),
+                           ("balance_before", "活跃前余额"), ("balance_after", "活跃后余额"),
+                           ("balance_delta", "差值"), ("msg", "说明"),
+                           ("domain", "域名"), ("rt_rotated", "令牌轮换")):
+              v = r.get(k, d.get(k))
+              if v is not None:
+                  print("| %s | %s |" % (label, str(v).replace("|", "\\|")))
+          for k in ("conversation_warning", "report_warning", "points_before_error",
+                    "points_after_error"):
+              if d.get(k):
+                  print("")
+                  print("> ⚠️ %s: %s" % (k, d[k]))
+          PY
+
+      - name: 失败时终止任务
+        if: steps.active.outcome != 'success'
+        run: |
+          echo "::error::国际版活跃未成功（退出码 ${{ steps.active.outputs.active_exit_code }}）"
+          exit 1
