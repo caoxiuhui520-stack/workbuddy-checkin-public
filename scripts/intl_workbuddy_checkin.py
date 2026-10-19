@@ -218,9 +218,16 @@ def points(token, uid, domain):
     if uid:
         h["X-User-Id"] = uid
     h["X-Domain"] = domain
-    st, resp, raw = http_json(GLOBAL_BILLING + POINTS_PATH, "POST", h, body)
+    resp = None
+    last_err = ""
+    # 国际版 billing 在 workbuddy.ai 上可用（实测）；codebuddy.ai 作为历史回退。
+    for host in (GLOBAL_BASE, GLOBAL_BILLING):
+        st, resp, raw = http_json(host + POINTS_PATH, "POST", h, body)
+        if isinstance(resp, dict):
+            break
+        last_err = "HTTP %s：%s" % (st, raw[:120])
     if not isinstance(resp, dict):
-        return None, "积分接口返回非 JSON（HTTP %s：%s）" % (st, raw[:120])
+        return None, "积分接口返回非 JSON（%s）" % last_err
     if resp.get("code") not in (0, None):
         return None, "积分查询失败 code=%s msg=%s" % (
             resp.get("code"), str(resp.get("msg") or "")[:120])
