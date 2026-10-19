@@ -448,6 +448,26 @@ def _extract_balance(*bodies):
     return None
 
 
+def _extract_streak(*bodies):
+    """从接口响应中尽力提取「连续签到天数」。找不到返回 None。"""
+    candidates = ("streak_days", "streak", "continuous_days", "streakDays")
+    sections = ("data", "result", "data.result", "")
+    for body in bodies:
+        if not isinstance(body, dict):
+            continue
+        for sec in sections:
+            node = body
+            for part in sec.split(".") if sec else []:
+                node = node.get(part) if isinstance(node, dict) else None
+            if not isinstance(node, dict):
+                continue
+            for k in candidates:
+                v = node.get(k)
+                if isinstance(v, (int, float)):
+                    return v
+    return None
+
+
 # ---------------- 失败推送（微信） ----------------
 
 def load_notify_config():
@@ -618,8 +638,16 @@ def notify_success(res):
             "### ✅ WorkBuddy签到助手 · 今日已签\n\n"
             "> **时间**：%s\n\n"
             "> **状态**：今日已签到，无需重复领取（幂等保护）\n\n"
-            "> **说明**：系统定时任务 / 技能已正常执行，无需处理。\n"
         ) % now
+        today_credit = (((res.get("detail") or {}).get("status_resp")
+                         or {}).get("data") or {}).get("today_credit")
+        if today_credit:
+            content += "> **今日积分**：+%s\n\n" % today_credit
+        if streak:
+            content += "> **连续签到**：第 %s 天\n\n" % streak
+        if balance is not None:
+            content += "> **当前积分余额**：%s\n\n" % balance
+        content += "> **说明**：系统定时任务 / 技能已正常执行，无需处理。\n"
     else:
         title = "✅ WorkBuddy签到助手 · 签到成功"
         lines = (
@@ -747,8 +775,12 @@ def run(check_only):
 
             if today_signed:
                 bal_txt = ("，当前积分余额 %s" % result["balance"]) if result.get("balance") is not None else ""
+                streak = _extract_streak(st_body)
+                if streak is not None:
+                    result["detail"]["streak_days"] = streak
+                streak_txt = ("，连续第 %s 天" % streak) if streak is not None else ""
                 result.update(status="ok", action="skip_already_signed",
-                              msg="今日已签到，无需重复领取" + bal_txt)
+                              msg="今日已签到，无需重复领取" + streak_txt + bal_txt)
                 return result
 
             # 2) 领取签到
