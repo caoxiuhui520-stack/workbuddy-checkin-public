@@ -112,3 +112,5 @@ jobs:
         run: |
           echo "::error::签到未成功（退出码 ${{ steps.checkin.outputs.checkin_exit_code }}），请查看上方日志与运行摘要"
           exit 1
+
+# 初始化：让 GitHub 重新索引本工作流（fork 后首次启用）
