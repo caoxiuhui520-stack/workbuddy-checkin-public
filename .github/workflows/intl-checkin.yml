@@ -12,7 +12,10 @@ name: WorkBuddy AI 国际版每日活跃
 #    WB_INTL_DOMAIN         可选，默认 www.workbuddy.ai
 #    WB_INTL_ENTERPRISE_ID  可选，企业账号
 #    WB_INTL_NICKNAME       可选，遥测昵称
-#    PUSHPLUS_TOKEN         可选，复用微信推送
+#    WECOM_WEBHOOK          可选，企业微信群机器人 webhook
+#    PUSHPLUS_TOKEN         可选，PushPlus 微信推送
+#    BARK_URL               可选，Bark 地址（https://api.day.app/<key>/）
+#    SERVERCHAN_SENDKEY     可选，Server酱 SendKey（SCT/SCU 开头）
 #    SUCCESS_NOTIFY         可选，true 时成功也推送；失败始终推送
 # ─────────────────────────────────────────────────────────────
 
@@ -54,7 +57,10 @@ jobs:
       WB_INTL_NICKNAME: ${{ secrets.WB_INTL_NICKNAME }}
       WB_INTL_MODEL: ${{ inputs.model || 'hy3' }}
       WB_INTL_PROMPT: ${{ inputs.prompt || '' }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      BARK_URL: ${{ secrets.BARK_URL }}
+      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
       SUCCESS_NOTIFY: ${{ secrets.SUCCESS_NOTIFY }}
 
     steps:
@@ -113,6 +119,10 @@ jobs:
               if d.get(k):
                   print("")
                   print("> ⚠️ %s: %s" % (k, d[k]))
+          notes = d.get("notify") or []
+          if notes:
+              print("")
+              print("**推送通道**：%s" % "、".join(str(x) for x in notes))
           PY
 
       - name: 失败时终止任务

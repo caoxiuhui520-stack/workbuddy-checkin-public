@@ -22,7 +22,12 @@
   WB_INTL_MODEL           默认 hy3
   WB_INTL_PROMPT          自定义提问（默认一句自然的多句问题）
   WB_INTL_MACHINE_ID      可选，稳定机器标识
-  PUSHPLUS_TOKEN          可选，微信推送
+
+推送环境变量（可选，四个通道互相独立，配了哪个推哪个）：
+  WECOM_WEBHOOK           企业微信群机器人 webhook 完整地址
+  PUSHPLUS_TOKEN          PushPlus token（微信）
+  BARK_URL                Bark 地址，形如 https://api.day.app/<key>/
+  SERVERCHAN_SENDKEY      Server酱 SendKey（SCT 开头为 Turbo，SCU 开头为旧版）
   SUCCESS_NOTIFY          true/1/yes 时成功也推送；失败始终推送
 
 安全：token 只在内存中使用，输出只报状态/长度，绝不回显内容。
@@ -477,15 +482,107 @@ def report_event(token, uid, domain, enterprise_id, nickname, prompt, model, con
 
 # ---------------------------------------------------------------- 推送
 
-def pushplus(title, content):
-    tok = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
-    if not tok:
-        return "skip(no token)"
-    payload = {"token": tok, "title": title, "content": content, "template": "markdown"}
-    st, resp, _ = http_json("https://www.pushplus.plus/send", "POST",
-                            {"Content-Type": "application/json"}, payload)
+PUSH_UA = "WorkBuddy-Intl-Checkin/1.0"
+
+
+def notify_via_wecom(webhook, title, content):
+    """企业微信群机器人：markdown 消息，标题并入正文。"""
+    payload = {"msgtype": "markdown", "markdown": {"content": content}}
+    st, resp, raw = http_json(webhook, "POST",
+                              {"Content-Type": "application/json",
+                               "User-Agent": PUSH_UA}, payload)
+    errcode = resp.get("errcode") if isinstance(resp, dict) else None
+    if st < 200 or st >= 300:
+        return "wecom:%s/%s" % (st, str(raw)[:80])
+    return "wecom:%s/%s" % (st, errcode)
+
+
+def notify_via_pushplus(token, title, content):
+    payload = {"token": token, "title": title, "content": content, "template": "markdown"}
+    st, resp, raw = http_json("https://www.pushplus.plus/send", "POST",
+                              {"Content-Type": "application/json",
+                               "User-Agent": PUSH_UA}, payload)
     code = resp.get("code") if isinstance(resp, dict) else None
+    if st < 200 or st >= 300:
+        return "pushplus:%s/%s" % (st, str(raw)[:80])
     return "pushplus:%s/%s" % (st, code)
+
+
+def notify_via_bark(bark_url, title, content):
+    """Bark：GET <base>/<urlencode(title)>/<urlencode(content)>。"""
+    base = bark_url.rstrip("/")
+    url = "%s/%s/%s" % (base, urllib.parse.quote(title), urllib.parse.quote(content))
+    st, resp, raw = http_json(url, "GET", {"User-Agent": PUSH_UA})
+    code = resp.get("code") if isinstance(resp, dict) else None
+    if st < 200 or st >= 300:
+        return "bark:%s/%s" % (st, str(raw)[:80])
+    return "bark:%s/%s" % (st, code)
+
+
+def notify_via_serverchan(sendkey, title, content):
+    """Server酱：SCT 开头走 Turbo（title/desp），SCU 开头走旧版（text/desp）。"""
+    if sendkey.startswith("SCU"):
+        url = "https://sc.ftqq.com/%s.send" % sendkey
+        form = {"text": title, "desp": content}
+    else:
+        url = "https://sctapi.ftqq.com/%s.send" % sendkey
+        form = {"title": title, "desp": content}
+    data = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("User-Agent", PUSH_UA)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            txt = resp.read(65536).decode("utf-8", "replace")
+            try:
+                code = json.loads(txt).get("code")
+            except Exception:
+                code = None
+            if resp.status < 200 or resp.status >= 300:
+                return "serverchan:%s/%s" % (resp.status, txt[:80])
+            return "serverchan:%s/%s" % (resp.status, code)
+    except urllib.error.HTTPError as e:
+        return "serverchan:%s/%s" % (e.code, e.read(4096).decode("utf-8", "replace")[:80])
+    except Exception as e:
+        return "serverchan_err:%s" % str(e)[:120]
+
+
+def _dispatch_channels(title, content):
+    """按环境变量向所有已启用通道推送，返回结果列表（不含任何密钥）。
+
+    顺序：企微 → PushPlus → Bark → Server酱。未配置的通道直接跳过。
+    """
+    results = []
+
+    webhook = (os.environ.get("WECOM_WEBHOOK") or "").strip()
+    if webhook:
+        try:
+            results.append(notify_via_wecom(webhook, title, content))
+        except Exception as e:
+            results.append("wecom_err:%s" % str(e)[:120])
+
+    token = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
+    if token:
+        try:
+            results.append(notify_via_pushplus(token, title, content))
+        except Exception as e:
+            results.append("pushplus_err:%s" % str(e)[:120])
+
+    bark = (os.environ.get("BARK_URL") or "").strip()
+    if bark:
+        try:
+            results.append(notify_via_bark(bark, title, content))
+        except Exception as e:
+            results.append("bark_err:%s" % str(e)[:120])
+
+    sc = (os.environ.get("SERVERCHAN_SENDKEY") or "").strip()
+    if sc:
+        try:
+            results.append(notify_via_serverchan(sc, title, content))
+        except Exception as e:
+            results.append("serverchan_err:%s" % str(e)[:120])
+
+    return results
 
 
 # ---------------------------------------------------------------- 主流程
@@ -568,18 +665,20 @@ def main():
     if res.get("status") == "ok" and not truthy(os.environ.get("SUCCESS_NOTIFY")):
         pass
     elif res.get("status") == "ok":
-        pushplus("✅ WorkBuddy AI 国际版 · 活跃已发送",
-                 "### ✅ WorkBuddy AI 国际版 · 活跃已发送\n\n"
-                 "> **时间**：%s\n\n> **模型**：%s\n\n> **余额**：%s → %s\n\n"
-                 "> **说明**：活跃积分由服务端延迟发放，次日复核。\n"
-                 % (now_local(), res.get("model"),
-                    res.get("balance_before"), res.get("balance_after")))
+        res["detail"]["notify"] = _dispatch_channels(
+            "✅ WorkBuddy AI 国际版 · 活跃已发送",
+            "### ✅ WorkBuddy AI 国际版 · 活跃已发送\n\n"
+            "> **时间**：%s\n\n> **模型**：%s\n\n> **余额**：%s → %s\n\n"
+            "> **说明**：活跃积分由服务端延迟发放，次日复核。\n"
+            % (now_local(), res.get("model"),
+               res.get("balance_before"), res.get("balance_after")))
     else:
-        pushplus("❌ WorkBuddy AI 国际版 · 活跃失败",
-                 "### ❌ WorkBuddy AI 国际版 · 活跃失败\n\n"
-                 "> **时间**：%s\n\n> **原因**：%s\n\n"
-                 "> **处理**：检查 WB_INTL_REFRESH_TOKEN / WB_INTL_UID 是否失效。\n"
-                 % (now_local(), res.get("msg")))
+        res["detail"]["notify"] = _dispatch_channels(
+            "❌ WorkBuddy AI 国际版 · 活跃失败",
+            "### ❌ WorkBuddy AI 国际版 · 活跃失败\n\n"
+            "> **时间**：%s\n\n> **原因**：%s\n\n"
+            "> **处理**：检查 WB_INTL_REFRESH_TOKEN / WB_INTL_UID 是否失效。\n"
+            % (now_local(), res.get("msg")))
 
     print(json.dumps(res, ensure_ascii=False, indent=2))
     return 0 if res.get("status") == "ok" else 1

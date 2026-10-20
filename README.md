@@ -34,6 +34,65 @@ python scripts/workbuddy_checkin.py --diagnose
 
 ---
 
+## 国际版 WorkBuddy AI（workbuddy.ai）
+
+国内版有「签到」按钮，**国际版没有**。国际版的每日福利按「活跃账号」发放：
+当天必须发起一次**客户端对话**（`chat_request_send`），服务端才记一次活跃，
+免费用户 30 积分/天、Pro 用户 50 积分/天（服务端延迟发放，当天不一定立刻到账）。
+
+因此「每天发一条请求」这件事，**只发一个 HTTP 请求是不够的**。脚本复刻的是完整桌面端链路：
+
+```
+WB_INTL_REFRESH_TOKEN
+      │ POST /v2/plugin/auth/token/refresh
+      ▼
+ accessToken
+      │ ① POST /console/as/conversations/v2   云端会话登记（尽力而为）
+      │ ② POST /v2/chat/completions           SSE 对话，system 必须在最前
+      │ ③ POST /v2/report                     遥测 chat_request_send（尽力而为）
+      │ ④ POST /v2/billing/meter/get-user-resource   查活跃前后余额
+      ▼
+   活跃计入 → 积分由服务端延迟发放
+```
+
+工作流文件：`.github/workflows/intl-checkin.yml`，脚本：`scripts/intl_workbuddy_checkin.py`。
+每天北京时间 **09:07** 自动跑一次，也可在 Actions 页面 **Run workflow** 手动触发。
+
+### 国际版 Secrets
+
+| Secret 名 | 内容 | 必填 |
+|---|---|---|
+| **`WB_INTL_REFRESH_TOKEN`** | 国际版长效令牌 | ✅ 必填 |
+| `WB_INTL_UID` | 账号 UID；留空则脚本从令牌 JWT 自动解析 | 建议填 |
+| `WB_INTL_DOMAIN` | 接口域名，默认 `www.workbuddy.ai` | 可选 |
+| `WB_INTL_ENTERPRISE_ID` | 企业账号 ID | 可选 |
+| `WB_INTL_NICKNAME` | 遥测昵称，只进上报字段 | 可选 |
+| `WB_INTL_MODEL` | 默认 `hy3` | 可选 |
+| `WB_INTL_PROMPT` | 自定义提问；留空用默认的一句自然多句问题 | 可选 |
+| `WB_INTL_MACHINE_ID` | 固定机器标识；留空按运行环境派生 | 可选 |
+
+> 令牌获取：`python scripts/export_intl_token.py`，脚本只输出状态与长度，**不回显令牌内容**。
+
+### 国际版推送
+
+与国内版**同一套通道、同一套语义**，直接从环境变量读取，不需要额外的配置文件：
+
+| Secret 名 | 通道 |
+|---|---|
+| `WECOM_WEBHOOK` | 企业微信群机器人 |
+| `PUSHPLUS_TOKEN` | PushPlus（微信） |
+| `BARK_URL` | Bark（iOS） |
+| `SERVERCHAN_SENDKEY` | Server酱 / 方糖（`SCT` 开头 Turbo，`SCU` 开头旧版） |
+| `SUCCESS_NOTIFY` | `true` / `1` / `yes` 时成功也推送 |
+
+- **失败始终推送**（凭据失效、对话被拒、网络异常都会推）。
+- **成功默认静默**，只有 `SUCCESS_NOTIFY` 为真才推。
+- 四个通道互相独立，**配了哪个推哪个**，全空则静默运行。
+- 每个通道的结果（如 `wecom:200/0`、`pushplus:200/200`）写进 `detail.notify`，
+  同时显示在 Actions 运行摘要里，**不含任何密钥**。
+
+---
+
 ## 签到链路（v2.1.0-ci）
 
 ```
@@ -69,6 +128,7 @@ python scripts/workbuddy_checkin.py --diagnose
 - **零硬编码凭据**：凭据全部走 GitHub Secrets / 环境变量，代码仓库里找不到任何密钥。
 - **适配 5.6.2+ 加密登录态**：走长效令牌通道，不依赖客户端常驻、也不需要本机解密能力。
 - **多渠道推送**：支持企业微信、PushPlus、Server酱（方糖）、Bark，成功 / 失败均可播报。
+- **国际版同日活跃**：`intl-checkin.yml` 每天复刻一次桌面端对话链路，领取国际版活跃积分；推送通道与国内版完全一致。
 - **日志脱敏**：**输出层 + 摘要层双重白名单过滤** —— 接口响应在写进结果前即被压缩为结论字段，
   **完整响应永不进入 stdout / `result.json` / Actions 运行日志**；凭据**只报长度、连字符片段都不输出**。
 - **零依赖**：仅用 Python 标准库，无需安装第三方包。
@@ -88,10 +148,13 @@ python scripts/workbuddy_checkin.py --diagnose
 
 ```
 .
-├── .github/workflows/checkin.yml      # 工作流：定时 + 手动触发，结果写 Action 摘要
+├── .github/workflows/checkin.yml      # 国内版工作流：定时 + 手动触发，结果写 Action 摘要
+├── .github/workflows/intl-checkin.yml # 国际版工作流：每日活跃对话 + 积分查询
 ├── scripts/
 │   ├── workbuddy_checkin.py           # 签到主脚本（长效令牌 / 短效令牌 / 文件，三通道）
+│   ├── intl_workbuddy_checkin.py      # 国际版活跃脚本（对话 + 遥测 + 积分）
 │   ├── gen_notify_config.py           # CI 环境从环境变量生成推送配置
+│   ├── export_intl_token.py           # 导出国际版长效令牌（只报长度，不回显）
 │   ├── sync_token_to_github.py        # 本机一键把凭据同步到 GitHub Secrets
 │   ├── copy_token_to_clipboard.py     # 复制凭据到剪贴板（手动配置兜底）
 │   └── summarize_result.py            # 白名单过滤，生成脱敏摘要
