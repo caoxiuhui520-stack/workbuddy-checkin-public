@@ -21,8 +21,8 @@ name: WorkBuddy AI 国际版每日活跃
 
 on:
   schedule:
-    # 北京时间 09:07 = UTC 01:07（避开整点拥堵）
-    - cron: '7 1 * * *'
+    # 北京时间 09:17 = UTC 01:17（避开整点调度高峰）
+    - cron: '17 1 * * *'
   workflow_dispatch:
     inputs:
       model:
@@ -114,6 +114,24 @@ jobs:
               v = r.get(k, d.get(k))
               if v is not None:
                   print("| %s | %s |" % (label, str(v).replace("|", "\\|")))
+
+          grant = d.get("daily_grant")
+          if grant:
+              print("| 今日积分 | +%s（%s 起生效） |" % (grant.get("size"), grant.get("start")))
+          else:
+              print("| 今日积分 | 尚未到账（服务端异步发放，通常数分钟内） |")
+
+          packs = d.get("today_packs") or []
+          if packs:
+              print("")
+              print("**今日新增套餐**")
+              print("")
+              print("| 套餐 | 额度 | 剩余 | 周期开始 |")
+              print("|---|---|---|---|")
+              for p in packs:
+                  print("| %s | %s | %s | %s |" % (
+                      p.get("name"), p.get("size"), p.get("remain"), p.get("start")))
+
           for k in ("conversation_warning", "report_warning", "points_before_error",
                     "points_after_error"):
               if d.get(k):

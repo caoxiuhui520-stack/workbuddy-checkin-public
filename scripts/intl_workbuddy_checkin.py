@@ -203,7 +203,17 @@ def auth_headers(token, uid, domain, enterprise_id, ua=INTL_UA, origin=GLOBAL_BA
 
 # ---------------------------------------------------------------- 积分
 
-def points(token, uid, domain):
+def points_detail(token, uid, domain):
+    """查询全部积分套餐明细。
+
+    返回 (detail, err)：
+      detail = {
+        "total_remain": int|None,   # 所有套餐剩余之和
+        "packs": [ {...}, ... ],    # 逐套餐明细（已脱敏，不含 Uin/DealName 等）
+      }
+    国际版的每日活跃积分以「新建一个 30/50 分的 Bonus Pack」形式发放，
+    而不是在旧套餐里加数；因此判断今日是否到账必须看套餐列表，不能只看总余额。
+    """
     now = time.localtime()
     begin = time.strftime("%Y-%m-%d %H:%M:%S", now)
     end = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 101 * 365 * 86400))
@@ -239,18 +249,52 @@ def points(token, uid, domain):
     data = resp.get("data") or {}
     inner = ((data.get("Response") or {}).get("Data") or {}) if isinstance(data, dict) else {}
     accounts = inner.get("Accounts") or []
+
+    packs = []
     total = 0
     found = False
     for p in accounts:
         if not isinstance(p, dict):
             continue
-        v = p.get("CycleCapacityRemain")
-        if not isinstance(v, (int, float)):
-            v = p.get("CapacityRemain")
-        if isinstance(v, (int, float)):
-            total += int(v)
+        remain = p.get("CycleCapacityRemain")
+        if not isinstance(remain, (int, float)):
+            remain = p.get("CapacityRemain")
+        size = p.get("CycleCapacitySize")
+        if not isinstance(size, (int, float)):
+            size = p.get("CapacitySize")
+        used = p.get("CycleCapacityUsed")
+        if not isinstance(used, (int, float)):
+            used = p.get("CapacityUsed")
+        if isinstance(remain, (int, float)):
+            total += int(remain)
             found = True
-    return (total if found else None), None
+        packs.append({
+            "name": p.get("PackageName"),
+            "code": p.get("PackageCode"),
+            "size": int(size) if isinstance(size, (int, float)) else None,
+            "remain": int(remain) if isinstance(remain, (int, float)) else None,
+            "used": int(used) if isinstance(used, (int, float)) else None,
+            "start": p.get("CycleStartTime"),
+            "end": p.get("CycleEndTime"),
+        })
+    packs.sort(key=lambda x: (x.get("start") or "", x.get("name") or ""))
+    return {"total_remain": (total if found else None), "packs": packs}, None
+
+
+def daily_grant(packs, day=None):
+    """从套餐明细里找出「今天新发的每日活跃包」。
+
+    判定：CycleStartTime 落在今天，且 CapacitySize 属于 30/50 这一档。
+    返回命中的套餐 dict，没有则 None。
+    """
+    day = day or time.strftime("%Y-%m-%d")
+    for p in packs or []:
+        start = p.get("start") or ""
+        if not start.startswith(day):
+            continue
+        if p.get("size") in (30, 50):
+            return p
+    return None
 
 
 # ---------------------------------------------------------------- 活跃链路
@@ -623,8 +667,8 @@ def run():
         "rt_rotated": bool(new_rt and new_rt != rt),
     })
 
-    before, perr = points(at, uid, domain)
-    res["balance_before"] = before
+    before, perr = points_detail(at, uid, domain)
+    res["balance_before"] = (before or {}).get("total_remain")
     if perr:
         res["detail"]["points_before_error"] = perr
 
@@ -642,17 +686,28 @@ def run():
     if rerr:
         res["detail"]["report_warning"] = rerr
 
-    after, perr2 = points(at, uid, domain)
-    res["balance_after"] = after
+    after, perr2 = points_detail(at, uid, domain)
+    res["balance_after"] = (after or {}).get("total_remain")
     if perr2:
         res["detail"]["points_after_error"] = perr2
 
     delta = None
-    if isinstance(before, int) and isinstance(after, int):
-        delta = after - before
+    if isinstance(res["balance_before"], int) and isinstance(res["balance_after"], int):
+        delta = res["balance_after"] - res["balance_before"]
+
+    # 每日活跃积分是「新建一个 30/50 分的 Bonus Pack」，不是旧套餐加数。
+    # 服务端异步发放，当场看不到属正常；只要当天最终出现该包即算到账。
+    packs = (after or {}).get("packs") or []
+    grant = daily_grant(packs)
+    today_packs = [p for p in packs
+                   if (p.get("start") or "").startswith(time.strftime("%Y-%m-%d"))]
     res.update(status="ok", action="active_chat_sent",
-               msg="已发送一次有效对话，国际版活跃按服务端认定发放（积分可能延迟到账）")
+               msg="已发送一次有效对话；每日活跃积分由服务端异步发放")
     res["detail"]["balance_delta"] = delta
+    res["detail"]["daily_grant"] = grant
+    res["detail"]["daily_grant_received"] = bool(grant)
+    res["detail"]["today_packs"] = today_packs
+    res["detail"]["pack_count"] = len(packs)
     res["detail"]["conversation_id"] = conv_id
     res["detail"]["prompt_length"] = len(prompt)
     res["detail"]["machine_id"] = machine_id()
@@ -665,12 +720,20 @@ def main():
     if res.get("status") == "ok" and not truthy(os.environ.get("SUCCESS_NOTIFY")):
         pass
     elif res.get("status") == "ok":
+        d = res.get("detail") or {}
+        grant = d.get("daily_grant")
+        if grant:
+            grant_line = "> **今日积分**：+%s（%s 起生效）\n\n" % (
+                grant.get("size"), grant.get("start"))
+        else:
+            grant_line = "> **今日积分**：尚未到账，服务端异步发放，通常数分钟内\n\n"
         res["detail"]["notify"] = _dispatch_channels(
             "✅ WorkBuddy AI 国际版 · 活跃已发送",
             "### ✅ WorkBuddy AI 国际版 · 活跃已发送\n\n"
-            "> **时间**：%s\n\n> **模型**：%s\n\n> **余额**：%s → %s\n\n"
-            "> **说明**：活跃积分由服务端延迟发放，次日复核。\n"
-            % (now_local(), res.get("model"),
+            "> **时间**：%s\n\n> **模型**：%s\n\n"
+            "%s> **余额**：%s → %s\n\n"
+            "> **说明**：活跃已上报，积分以「新建 Bonus Pack」形式发放。\n"
+            % (now_local(), res.get("model"), grant_line,
                res.get("balance_before"), res.get("balance_after")))
     else:
         res["detail"]["notify"] = _dispatch_channels(
